@@ -1,0 +1,336 @@
+import time
+from collections import deque, namedtuple
+
+import random
+import gym
+import numpy as np
+import PIL.Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import utils  
+utils.set_seed(utils.SEED)
+env=gym.make("LunarLander-v2",render_mode="rgb_array")
+env.reset()
+frame = env.render()  
+PIL.Image.fromarray(frame)
+state_size=env.observation_space.shape
+num_action=env.action_space.n
+print('state shape:',state_size)
+print('num action:',num_action)
+initial_state = env.reset() #初始环境
+# 临时为 NumPy 添加 bool8 属性
+if not hasattr(np, 'bool8'):
+    np.bool8 = np.bool_
+
+# 选择0，1，2，3
+action = 0
+
+next_state, reward, terminated, truncated, info = env.step(action)
+
+# 合并 terminated 和 truncated 为一个 done 标志
+done = terminated or truncated
+
+with np.printoptions(formatter={'float': '{:.3f}'.format}):
+    print("Initial State:", initial_state)
+    print("Action:", action)
+    print("Next State:", next_state)
+    print("Reward Received:", reward)
+    print("Episode Terminated:", done)
+    print("Info:", info)
+
+class Qnetwork(nn.Module):
+    def __init__(self,state_size,num_actions):
+        super(Qnetwork,self).__init__()
+        self.model=nn.Sequential(
+            nn.Linear(state_size,64),
+            nn.ReLU(),
+            nn.Linear(64,64),
+            nn.ReLU(),
+            nn.Linear(64,num_actions)
+        )
+    def forward(self, state):
+        return self.model(state)
+state_sizes=8
+#实例化两个网络
+q_network=Qnetwork(state_sizes,num_action)
+target_q_network=Qnetwork(state_sizes,num_action)
+
+#复制参数两个网络初始参数相同
+target_q_network.load_state_dict(q_network.state_dict())
+target_q_network.eval()  # target 网络通常不进行训练
+
+#优化器
+optimizer=optim.Adam(q_network.parameters(),lr=ALPHA)
+from torchsummary import summary
+
+# 假设你的输入状态是长度为 8 的向量
+summary(q_network, input_size=(8,))
+experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
+import torch.nn.functional as F
+
+def compute_loss(experiences, gamma, q_network, target_q_network):
+    """ 
+    使用 PyTorch 计算 DQN 中的均方误差（MSE）损失。
+
+    参数：
+        experiences: 元组，包含 (states, actions, rewards, next_states, done_vals)
+        gamma: 折扣因子（float）
+        q_network: 当前 Q 网络（用于预测当前状态下的动作价值）
+        target_q_network: 目标 Q 网络（用于预测目标 Q 值）
+
+    返回：
+        loss: 均方误差损失（torch.Tensor）
+    """
+
+    # 解包经验元组
+    states, actions, rewards, next_states, done_vals = experiences
+
+    # 使用目标网络计算下一状态的最大 Q 值（不需要梯度）
+    with torch.no_grad():
+        max_next_q_values = target_q_network(next_states).max(dim=1)[0]
+
+    # 计算目标值 y：
+    # 如果 done 为 1，说明 episode 结束，只使用 reward；
+    # 如果 done 为 0，使用 Bellman 方程：reward + gamma * max_next_q
+    y_targets = rewards + gamma * max_next_q_values * (1 - done_vals)
+
+    # 使用当前网络计算每个状态对应动作的 Q 值 Q(s,a)
+    q_values = q_network(states)
+    actions = actions.long().unsqueeze(1)  # 扩展维度以便用于 gather
+    q_values = q_values.gather(1, actions).squeeze(1)  # 按照动作索引提取 Q 值
+
+    # 计算均方误差损失
+    loss = F.mse_loss(q_values, y_targets)
+
+    return loss
+def agent_learn(experiences, gamma, q_network, target_q_network, optimizer, utils):
+    """
+    更新 Q 网络的参数。
+    
+    参数：
+        experiences: tuple，包含 (states, actions, rewards, next_states, done_vals)
+        gamma: 折扣因子（float）
+        q_network: 当前 Q 网络（torch.nn.Module）
+        target_q_network: 目标 Q 网络（torch.nn.Module）
+        optimizer: 用于训练 q_network 的优化器（如 Adam）
+        utils: 工具模块，包含 update_target_network 函数
+    """
+
+    # 清零梯度
+    optimizer.zero_grad()
+    
+    # 计算损失
+    loss = compute_loss(experiences, gamma, q_network, target_q_network)
+
+    # 反向传播
+    loss.backward()
+
+    # 更新 q_network 参数
+    optimizer.step()
+
+    # 将 q_network 的权重复制到 target_q_network
+    utils.update_target_network(q_network, target_q_network)
+
+start=time.time()
+num_episodes=2000
+max_num_timesteps=1000
+
+total_point_history=[]
+
+num_p_va=100
+epsilon=1
+
+memory_buffer=deque(maxlen=MEMORY_SIZE)
+
+target_q_network.load_state_dict(q_network.state_dict())
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+for i in range(num_episodes):
+    state,_=env.reset()
+    total_points=0
+    for t in range(max_num_timesteps):
+        state_qn=np.expand_dims(state,axis=0) #将 state 从形状 (n,) 扩展为 (1, n)，因为神经网络模型（q_network）通常需要输入一个**批量（batch）**的形式，即二维数组。
+        state_qn_tensor = torch.tensor(state_qn, dtype=torch.float32).to(device)
+        q_values=q_network(state_qn_tensor)
+        action=utils.get_action(q_values,epsilon)
+        next_state,reward,terminated,truncated,info=env.step(action)
+        done=terminated or truncated
+        memory_buffer.append(experience(state,action,reward,next_state,done))
+
+        update=utils.check_update_conditions(t,NUM_STEPS_FOR_UPDATE,memory_buffer)
+
+        if update:
+            experiences=utils.get_experiences(memory_buffer)
+            agent_learn(experiences,GAMMA,q_network, target_q_network, optimizer, utils)
+        state=next_state.copy()
+        total_points+=reward
+
+        if done:
+            break
+    total_point_history.append(total_points)
+    av_latest_points = np.mean(total_point_history[-num_p_va:])#从倒数第100一直到结束 这些值的平均值
+    
+    epsilon = utils.get_new_eps(epsilon)
+    
+    print(f"\rEpisode{i+1}|最近100次回合中平均值为：{av_latest_points:.2f}", end="")
+
+    if (i+1) % num_p_va == 0:
+        print(f"\rEpisode {i+1} | 最近100次回合中平均值为：{av_latest_points:.2f}")
+
+    if av_latest_points >= 200.0:
+        print(f"\n\n环境在{i+1} 解决!")
+        torch.save(q_network.state_dict(), 'lunar_lander_model.pth')
+        break
+tot_time = time.time() - start
+
+print(f"\n花费了{tot_time:.2f} s ({(tot_time/60):.2f} min)")
+utils.plot_history(total_point_history)
+# Suppress warnings from imageio
+import logging
+logging.getLogger().setLevel(logging.ERROR)
+filename = "lunar_lander.mp4"
+
+utils.create_video(filename, env, q_network)
+utils.embed_mp4(filename)
+import base64
+import random
+from itertools import zip_longest
+
+import imageio
+import IPython
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from statsmodels.iolib.table import SimpleTable
+
+
+SEED = 0              # seed for pseudo-random number generator
+MINIBATCH_SIZE = 64   # mini-batch size
+TAU = 1e-3            # soft update parameter
+E_DECAY = 0.995       # ε decay rate for ε-greedy policy
+E_MIN = 0.01          # minimum ε value for ε-greedy policy
+
+
+random.seed(SEED)
+
+
+def get_experiences(memory_buffer):
+    experiences = random.sample(memory_buffer, k=MINIBATCH_SIZE)
+    states = tf.convert_to_tensor(np.array([e.state for e in experiences if e is not None]),dtype=tf.float32)
+    actions = tf.convert_to_tensor(np.array([e.action for e in experiences if e is not None]), dtype=tf.float32)
+    rewards = tf.convert_to_tensor(np.array([e.reward for e in experiences if e is not None]), dtype=tf.float32)
+    next_states = tf.convert_to_tensor(np.array([e.next_state for e in experiences if e is not None]),dtype=tf.float32)
+    done_vals = tf.convert_to_tensor(np.array([e.done for e in experiences if e is not None]).astype(np.uint8),
+                                     dtype=tf.float32)
+    return (states, actions, rewards, next_states, done_vals)
+
+
+def check_update_conditions(t, num_steps_upd, memory_buffer):
+    if (t + 1) % num_steps_upd == 0 and len(memory_buffer) > MINIBATCH_SIZE:
+        return True
+    else:
+        return False
+    
+    
+def get_new_eps(epsilon):
+    return max(E_MIN, E_DECAY*epsilon)
+
+
+def get_action(q_values, epsilon=0):
+    if random.random() > epsilon:
+        return np.argmax(q_values.numpy()[0])
+    else:
+        return random.choice(np.arange(4))
+    
+    
+def update_target_network(q_network, target_q_network):
+    for target_weights, q_net_weights in zip(target_q_network.weights, q_network.weights):
+        target_weights.assign(TAU * q_net_weights + (1.0 - TAU) * target_weights)
+    
+
+def plot_history(reward_history, rolling_window=20, lower_limit=None,
+                 upper_limit=None, plot_rw=True, plot_rm=True):
+    
+    if lower_limit is None or upper_limit is None:
+        rh = reward_history
+        xs = [x for x in range(len(reward_history))]
+    else:
+        rh = reward_history[lower_limit:upper_limit]
+        xs = [x for x in range(lower_limit,upper_limit)]
+    
+    df = pd.DataFrame(rh)
+    rollingMean = df.rolling(rolling_window).mean()
+
+    plt.figure(figsize=(10,7), facecolor='white')
+    
+    if plot_rw:
+        plt.plot(xs, rh, linewidth=1, color='cyan')
+    if plot_rm:
+        plt.plot(xs, rollingMean, linewidth=2, color='magenta')
+
+    text_color = 'black'
+        
+    ax = plt.gca()
+    ax.set_facecolor('black')
+    plt.grid()
+#     plt.title("Total Point History", color=text_color, fontsize=40)
+    plt.xlabel('Episode', color=text_color, fontsize=30)
+    plt.ylabel('Total Points', color=text_color, fontsize=30)
+    yNumFmt = mticker.StrMethodFormatter('{x:,}')
+    ax.yaxis.set_major_formatter(yNumFmt)
+    ax.tick_params(axis='x', colors=text_color)
+    ax.tick_params(axis='y', colors=text_color)
+    plt.show()
+    
+    
+def display_table(initial_state, action, next_state, reward, done):
+
+    action_labels = ["Do nothing", "Fire right engine", "Fire main engine", "Fire left engine"]
+    
+    # Do not use column headers
+    column_headers = None
+
+    with np.printoptions(formatter={'float': '{:.3f}'.format}):
+        table_info = [("Initial State:", [f"{initial_state}"]),
+                      ("Action:", [f"{action_labels[action]}"]),
+                      ("Next State:", [f"{next_state}"]),
+                      ("Reward Received:", [f"{reward:.3f}"]),
+                      ("Episode Terminated:", [f"{done}"])]
+
+    # Generate table  
+    row_labels, data = zip_longest(*table_info)
+    table = SimpleTable(data, column_headers, row_labels)
+
+    return table
+
+
+def embed_mp4(filename):
+    """Embeds an mp4 file in the notebook."""
+    video = open(filename,'rb').read()
+    b64 = base64.b64encode(video)
+    tag = '''
+    <video width="840" height="480" controls>
+    <source src="data:video/mp4;base64,{0}" type="video/mp4">
+    Your browser does not support the video tag.
+    </video>'''.format(b64.decode())
+    return IPython.display.HTML(tag)
+        
+        
+def create_video(filename, env, q_network, fps=30):
+    with imageio.get_writer(filename, fps=fps) as video:
+        done = False
+        state,_= env.reset()
+        frame = env.render()
+        video.append_data(frame)
+        while not done:    
+            state = np.expand_dims(state, axis=0)
+            q_values = q_network(state)
+            action = np.argmax(q_values.numpy()[0])
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            state=next_state
+            frame = env.render()
+            video.append_data(frame)
